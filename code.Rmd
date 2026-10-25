@@ -1,0 +1,1748 @@
+---
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# 0. Setup and libraries
+
+```{r}
+library(dplyr) 
+library(lubridate) 
+library(fastDummies) 
+library(readr)
+library(ggplot2) 
+library(corrplot) 
+library(tidyr) 
+library(scales)
+library(forcats) 
+library(stringr) 
+library(reshape2) 
+library(caret)
+library(pROC) 
+library(glmnet) 
+library(pls) 
+library(MASS)
+library(classmap)
+library(ranger)
+library(pscl)
+library(factoextra)
+library(corrplot)
+```
+
+# 1. Data loading
+
+```{r}
+ifood_df <- read.csv("data.csv")
+```
+
+# 2. Preprocessing
+
+## 2.1. Duplicates
+
+There are 2 kinds of duplicated entries in this dataset:
+
+\- same response across duplicates;
+
+\- different response across duplicates.
+
+In the first case we will keep one and delete the remaining duplicates.
+In the second case we will delete all of them.
+
+```{r}
+ifood_df <- ifood_df %>%
+  group_by(across(-c(ID,Response))) %>%
+  filter(!(n() > 1 & n_distinct(Response) > 1)) %>%
+  slice(1) %>%
+  ungroup()
+
+ifood_df <- as.data.frame(ifood_df)
+nrow(ifood_df)
+```
+
+## 2.2. Data Transformation and Feature Engineering
+
+The main data transformations and feature engineering steps were: the
+customer join date was converted into the number of days as as customer,
+the birth year was transformed into age, aggregated variables such as
+total purchases and total accepted campaigns were created, and
+unnecessary columns were removed or reordered to improve data usability.
+
+```{r}
+# Convert Dt_Customer to proper Date format
+ifood_df$Dt_Customer <- ymd(ifood_df$Dt_Customer)
+
+# Find reference date = max(Dt_Customer) + 100 days
+ref_date <- max(ifood_df$Dt_Customer, na.rm = TRUE) + days(100)
+
+# Create Customer Age Column
+ifood_df <- ifood_df %>%
+  mutate(Age = year(ref_date) - Year_Birth)
+
+# Number of days as a customer using ref_date
+ifood_df <- ifood_df %>%
+  mutate(Customer_Days = as.numeric(difftime(ref_date, Dt_Customer, units = "days")))
+
+# Drop unused columns
+ifood_df <- ifood_df %>%
+  dplyr::select(-ID, -Year_Birth, -Dt_Customer,-Z_CostContact,-Z_Revenue)
+
+# Sum of purchases
+ifood_df <- ifood_df %>%
+  mutate(MntTotal = MntWines + MntFruits + MntMeatProducts + MntFishProducts + MntSweetProducts)
+
+# Sum of accepted campaigns
+ifood_df$TotalCmp <- rowSums(ifood_df[, c("AcceptedCmp1","AcceptedCmp2","AcceptedCmp3","AcceptedCmp4","AcceptedCmp5")])
+
+# Move Age to the first position
+ifood_df <- ifood_df %>%
+  relocate(Age, .before = 1)
+
+# Move Customer_Days to be right before Recency
+ifood_df <- ifood_df %>%
+  relocate(Customer_Days, .before = Recency)
+
+ifood_df <- ifood_df %>%
+  relocate(MntTotal, .before = NumDealsPurchases)
+
+ifood_df <- ifood_df %>%
+  relocate(TotalCmp, .before = Complain)
+```
+
+## 2.3. Handling non-compliant / inconsistent responses
+
+### 2.3.1. Marital Status
+
+```{r}
+# Marital -> Replace certain values with "Single"
+ifood_df$Marital_Status[ifood_df$Marital_Status %in% c("Alone", "Absurd", "YOLO")] <- "Single"
+```
+
+### 2.3.2. Income
+
+```{r}
+# Filter matching entries (excluding row 1505)
+matching_group <- ifood_df %>%
+  filter(Education == "Graduation",
+         Marital_Status == "Together",
+         Age >= 30,
+         Age <= 50,
+         row_number() != 1505)
+mean_income <- mean(matching_group$Income, na.rm = TRUE)
+
+# Update Income in row 1505
+ifood_df$Income[1505] <- round(mean_income)
+
+nrow(matching_group)
+round(mean_income)
+```
+
+### 2.3.3. Age
+
+```{r}
+matching_group <- ifood_df %>%
+  filter(Education == "2n Cycle",
+         Marital_Status == "Single",
+         row_number() != 1)
+mean_age <- mean(matching_group$Age, na.rm = TRUE)
+
+ifood_df$Age[1] <- round(mean_age)
+
+nrow(matching_group)
+round(mean_age)
+
+matching_group <- ifood_df %>%
+  filter(Education == "PhD",
+         Marital_Status == "Together",
+         row_number() != 2)
+mean_age <- mean(matching_group$Age, na.rm = TRUE)
+
+ifood_df$Age[2] <- round(mean_age)
+
+nrow(matching_group)
+round(mean_age)
+
+matching_group <- ifood_df %>%
+  filter(Education == "2n Cycle",
+         Marital_Status == "Divorced",
+         row_number() != 3)
+mean_age <- mean(matching_group$Age, na.rm = TRUE)
+
+ifood_df$Age[3] <- round(mean_age)
+
+nrow(matching_group)
+round(mean_age)
+```
+
+## 2.4. Missing Values
+
+```{r}
+data.frame(
+  Column = names(ifood_df),
+  Missing_Values = colSums(is.na(ifood_df))
+)
+```
+
+We substituted them according to the demographic's mean - Same
+Education - Same Marital Status - ±10 years of age.
+
+```{r}
+# Replace missing Income values
+ifood_df <- ifood_df %>%
+  rowwise() %>%
+  mutate(
+    Income = ifelse(
+      is.na(Income),
+      {
+        # Get current row values
+        curr_edu <- Education
+        curr_mari <- Marital_Status
+        curr_age <- Age
+
+        # Filter matching rows from dataset (excluding current)
+        mean_income <- ifood_df %>%
+          filter(Education == curr_edu,
+                 Marital_Status == curr_mari,
+                 Age >= curr_age - 10,
+                 Age <= curr_age + 10,
+                 !is.na(Income)) %>%
+          summarise(mean_income = mean(Income, na.rm = TRUE)) %>%
+          pull(mean_income)
+
+        # Convert final value to integer
+        as.integer(mean_income)
+        print(as.integer(mean_income))
+      },
+      Income
+    )
+  ) %>%
+  ungroup()
+
+ifood_df <- as.data.frame(ifood_df)
+```
+
+# 3. Explanatory Data Analysis (EDA)
+
+What does the average customer look like for this company? Which
+marketing campaign was most successful? Which products are performing
+best? Which channels are underperforming?
+
+## 3.1. Target Variable Overview
+
+```{r}
+prop.table(table(ifood_df$Response)) 
+# Unbalanced
+cost_FP <- 3
+gain_TP <- 8
+
+response_rate <- mean(ifood_df$Response == 1) #P(Y=1)
+response_rate
+profit_contact_all <- response_rate * gain_TP - cost_FP
+profit_contact_all 
+total_profit_contact_all <- profit_contact_all * nrow(ifood_df)
+total_profit_contact_all
+ggplot(ifood_df, aes(x = as.factor(Response))) +
+  geom_bar(aes(y = after_stat(count / sum(count) * 100)),
+           fill = "steelblue") +
+  geom_text(
+    aes(label = paste0(round(after_stat(count / sum(count) * 100), 1), "%"),
+    y = after_stat(count / sum(count) * 100)),
+    stat = "count",
+    vjust = -0.5
+  ) +
+  labs(
+    y = "Percentage of customers (%)",
+    x = "Campaign response",
+    title = "Campaign response distribution"
+  ) +
+  coord_cartesian(ylim=c(0, 100)) +
+  theme_minimal()
+```
+
+## 3.2. Customer Profile
+
+### 3.2.1. Marital Status Distribution
+
+```{r}
+ggplot(ifood_df, aes(x=Marital_Status))+
+  geom_bar()+
+  ggtitle("Marital Status Distribution")+
+  theme_minimal()
+# Most are married
+```
+
+### 3.2.2. Education Level Distribution
+
+```{r}
+ggplot(ifood_df, aes(x=Education))+
+  geom_bar()+
+  ggtitle("Education Distribution")+
+  theme_minimal()
+# Most are highly educated
+```
+
+### 3.2.3. Income Distribution by Education and Marital Status
+
+```{r}
+ggplot(ifood_df, aes(Education, Income)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = scales::label_number(scale = 1/1000, suffix = "k"))+
+  ggtitle("Income by Education level")+
+  theme_minimal()
+```
+
+```{r}
+ggplot(ifood_df, aes(x=Education, y=Income, fill = Marital_Status))+
+  geom_bar(stat = "identity",position = "dodge")+
+  facet_wrap(~I(Kidhome+Teenhome))+
+  scale_y_continuous(labels = label_number(scale = 1/1000, suffix = "k")) +
+  ggtitle("Income by Marital Status and household composition")+
+  theme_bw()+
+  theme(legend.position="top",axis.text.x = element_text(angle = 35, hjust = 1))
+```
+
+```{r}
+ggplot(ifood_df, aes(Education, Income, fill = Marital_Status)) +
+  geom_boxplot() +
+  facet_wrap(~ Marital_Status)+
+  ggtitle("Income by Education and Marital Status")+
+  theme_bw()+
+  theme(legend.position="top",axis.text.x = element_text(angle = 35, hjust = 1))
+```
+
+### 3.2.4. Average Customer Profile
+
+```{r}
+ifood_df %>%
+  group_by(Education) %>%
+  summarise(resp_rate = mean(Response),
+            Perc = n()/nrow(ifood_df)) %>%  #most are graduate, the more educated higher the acceptance
+  arrange(desc(resp_rate))
+
+ifood_df %>%
+  group_by(Marital_Status) %>%
+  summarise(resp_rate = mean(Response),
+            Perc = n()/nrow(ifood_df)) %>%  #most are in a relationship (married or together), people that aren't in a relationship (single, divorced and widow) have a higher acceptance
+  arrange(desc(resp_rate))
+
+ifood_df %>%
+  group_by(Kidhome) %>%
+  summarise(resp_rate = mean(Response),
+            Perc = n()/nrow(ifood_df)) %>% #most people have 1 or no children and people with fewer children have a higher acceptance
+  arrange(desc(resp_rate))
+
+ifood_df %>%
+  group_by(Teenhome) %>%
+  summarise(resp_rate = mean(Response),
+            Perc = n()/nrow(ifood_df)) %>% #most have 1 or none teen and people with no teens are more likely to accept
+  arrange(desc(resp_rate))
+
+ifood_df %>%
+  group_by(Complain) %>%
+  summarise(resp_rate = mean(Response),
+            Perc = n()/nrow(ifood_df)) %>% #almost no one made a complain. This most likely is not a good discriminative feature for that reason: the response rate for the ones who complain is not viable
+  arrange(desc(resp_rate))
+
+ifood_df %>%
+  group_by(TotalCmp) %>%
+  summarise(resp_rate = mean(Response),
+            Perc = n()/nrow(ifood_df)) %>% #the majority of the customers don't accept the campaigns. A customer who tends to accept the prior campaigns is more likely to accept this one
+  arrange(desc(resp_rate))
+```
+
+```{r}
+ifood_df %>%
+  group_by(Response) %>%
+  summarise(
+    n          = n(),
+    mean_income = mean(Income, na.rm = TRUE), #more money->accept
+    median_income = median(Income), #non responsers not skewed
+    mean_mnttotal = mean(MntTotal), #spend more money ->accept
+    median_mnttotal = median(MntTotal), #skewed, most people don't spend huge amounts of money
+    mean_age   = mean(Age), #not a strong discriminative power
+    median_age = median(Age),
+    mean_recency  = mean(Recency), #customers that bought something recently tend to accept
+    median_recency = median(Recency), #not skewed
+    mean_customer_days = mean(Customer_Days), #loyalty helps
+    median_customer_days = median(Customer_Days)
+  )
+```
+
+### 3.2.5. Distribution of Key Numeric Variables
+
+```{r}
+# Simple summary plot: histogram age, income distribution and spend
+ggplot(ifood_df, aes(Age)) + geom_histogram(binwidth = 3) + labs(title="Age distribution") + theme_minimal()
+ggplot(ifood_df, aes(Income)) + geom_histogram() + scale_x_continuous(labels = label_number(scale = 1/1000, suffix = "k")) + labs(title="Income distribution") + theme_minimal()
+ggplot(ifood_df, aes(MntTotal)) + geom_histogram() + scale_x_continuous(labels = label_number(scale = 1/1000, suffix = "k")) + labs(title="Total spend distribution") +  theme_minimal()
+# The typical ifood customer is around 45 years old, with 52K income, education level graduated and married and spends on average 560 per year (according to mode and mean of dataset)
+```
+
+## 3.3. Marketing Campaign Performance
+
+### 3.3.1. Campaign Acceptance Rates
+
+```{r}
+campaign_summary <- ifood_df %>%
+    summarise(
+      response_rate = mean(Response==1, na.rm=TRUE),
+      across(starts_with("AcceptedCmp"), ~mean(.==1, na.rm=TRUE), .names = "rate_{col}")
+    ) %>%
+    pivot_longer(everything(), names_to="metric", values_to="value")
+  campaign_summary
+  # Plot (accepted campaigns rates)
+  ifood_df %>%
+    dplyr::select(starts_with("AcceptedCmp")) %>%
+    pivot_longer(everything(), names_to="cmp", values_to="accepted") %>%
+    group_by(cmp) %>%
+    summarise(rate = mean(accepted==1, na.rm=TRUE)) %>%
+    ggplot(aes(x=fct_reorder(cmp, rate), y=rate)) +
+    geom_col() + scale_y_continuous(labels = percent_format()) + coord_flip() +
+    labs(title="Acceptance rate by Campaign", y="Acceptance rate", x="Campaign")+
+    theme_minimal()
+# There is no campaign that stands out for high acceptance and campaign 2 was very low compared to the others
+```
+
+## 3.4. Sales Channels Analysis
+
+### 3.4.1. Average Channel Usage
+
+```{r}
+channel_cols <- c("NumWebPurchases","NumStorePurchases","NumCatalogPurchases","NumDealsPurchases","NumWebVisitsMonth")
+ifood_df %>%
+  dplyr::select(all_of(channel_cols)) %>%
+  summarise(across(everything(), ~mean(. , na.rm=TRUE))) %>%
+  pivot_longer(everything(), names_to="channel", values_to="avg") %>%
+  ggplot(aes(x=fct_reorder(channel, avg), y=avg)) + geom_col() + coord_flip() + labs(title="Avg activity by channel") + theme_minimal()
+# Store purchases are the higher
+```
+
+### 3.4.2. Channel Usage by Campaign Response
+
+```{r}
+ifood_df %>%
+    dplyr::select(Response, all_of(channel_cols)) %>%
+    pivot_longer(-Response, names_to="channel", values_to="val") %>%
+    group_by(channel, Response) %>%
+    summarise(mean_val = mean(val, na.rm=TRUE), .groups="drop") %>%
+    ggplot(aes(x=channel, y=mean_val, fill=factor(Response))) + geom_col(position="dodge") +
+    labs(title="Channel usage by Response", y="mean usage", fill="Response")+
+    scale_x_discrete(guide = guide_axis(n.dodge = 2))+
+    theme_minimal()+
+    theme(axis.text.x = element_text(size = 12), legend.position = "top")
+```
+
+### 3.4.3. Channel Usage by Education Level
+
+```{r}
+ifood_df %>%
+    dplyr::select(Education, all_of(channel_cols)) %>%
+    pivot_longer(-Education, names_to="channel", values_to="val") %>%
+    group_by(channel, Education) %>%
+    summarise(mean_val = mean(val, na.rm=TRUE), .groups="drop") %>%
+    ggplot(aes(x=channel, y=mean_val, fill=factor(Education))) + geom_col(position="dodge") + coord_flip() +
+    labs(title="Channel usage by Response", y="mean usage", fill="Response") + theme_minimal()
+```
+
+### 3.4.4. Channel Usage by Marital Status
+
+```{r}
+ifood_df %>%
+    dplyr::select(Marital_Status, all_of(channel_cols)) %>%
+    pivot_longer(-Marital_Status, names_to="channel", values_to="val") %>%
+    group_by(channel, Marital_Status) %>%
+    summarise(mean_val = mean(val, na.rm=TRUE), .groups="drop") %>%
+    ggplot(aes(x=channel, y=mean_val, fill=factor(Marital_Status))) + geom_col(position="dodge") + coord_flip() +
+    labs(title="Channel usage by Response", y="mean usage", fill="Response") + theme_minimal()
+```
+
+## 3.5. Product Spending Behavior
+
+### 3.5.1. Total Spending by Marital Status
+
+```{r}
+mnt_cols <- names(ifood_df)[str_detect(names(ifood_df), "^Mnt")]
+mnt_by_marital <- ifood_df %>%
+  group_by(Marital_Status) %>%
+  summarise(across(all_of(mnt_cols), ~sum(. , na.rm=TRUE)), total_spend = sum(MntTotal, na.rm=TRUE)) %>%
+  arrange(desc(total_spend))
+mnt_by_marital
+
+# Plot total spend by marital status
+mnt_by_marital %>%
+  ggplot(aes(x=fct_reorder(Marital_Status, total_spend), y=total_spend)) +
+  geom_col() + coord_flip() + scale_y_continuous(labels = label_number(scale = 1/1000, suffix = "k")) +
+  labs(title = "Total spend by Marital Status", y="Total spend")+
+  theme_minimal()
+```
+
+### 3.5.2. Average Product Spend by Marital Status
+
+```{r}
+# Product-level breakdown by marital status (stacked or faceted)
+ifood_df %>%
+  group_by(Marital_Status) %>%
+  summarise(across(all_of(mnt_cols), ~mean(. , na.rm=TRUE))) %>%
+  pivot_longer(-Marital_Status, names_to="product", values_to="avg_spend") %>%
+  ggplot(aes(x=product, y=avg_spend, fill=Marital_Status)) +
+  geom_col(position="dodge") + coord_flip() + labs(title="Avg product spend by marital status") +
+  scale_y_continuous(labels = label_number(scale = 1/1000, suffix="k")) + theme_minimal()
+# Customers who are married show the highest total spend, especially on wine and meat products - widows spend more by plot
+```
+
+## 3.6. Response Analysis by Demographics
+
+```{r}
+# Frequency of each marital status
+
+# Frequency table: one row per Marital_Status
+freq_df <- ifood_df %>%
+  count(Marital_Status) %>%
+  mutate(width = n / sum(n)) %>%
+  arrange(Marital_Status) %>%
+  mutate(
+    xmin = lag(cumsum(width), default = 0),
+    xmax = cumsum(width),
+    xmid = (xmin + xmax) / 2
+  )
+
+plot_df <- ifood_df %>%
+  count(Marital_Status, Response) %>%
+  group_by(Marital_Status) %>%
+  mutate(
+    p = n / sum(n),
+    cum = cumsum(p),
+    ymax = 1 - lag(cum, default = 0),
+    ymin = ymax - p
+  ) %>%
+  left_join(freq_df, by = "Marital_Status")
+```
+
+```{r}
+ggplot(plot_df) +
+  geom_rect(
+    aes(
+      xmin = xmin, xmax = xmax,
+      ymin = ymin, ymax = ymax,
+      fill = factor(Response)
+    ),
+    color = "white"
+  ) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_x_continuous(
+    breaks = freq_df$xmid, # all centers
+    labels = freq_df$Marital_Status, # same length
+    expand = c(0, 0)
+  ) +
+  labs(
+    title = "Response distribution within Marital Status\n(bar width = proportional to category size)",
+    x = "Marital Status",
+    y = "Percentage",
+    fill = "Response"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 14))
+
+```
+
+### 3.6.2. Response Rate by Educational Level
+
+```{r}
+freq_df <- ifood_df %>%
+  count(Education) %>%
+  mutate(width = n / sum(n)) %>%
+  arrange(Education) %>%
+  mutate(
+    xmin = lag(cumsum(width), default = 0),
+    xmax = cumsum(width),
+    xmid = (xmin + xmax) / 2
+  )
+
+plot_df <- ifood_df %>%
+  count(Education, Response) %>%
+  group_by(Education) %>%
+  mutate(
+    p = n / sum(n),
+    cum = cumsum(p),
+    ymax = 1 - lag(cum, default = 0),
+    ymin = ymax - p
+  ) %>%
+  left_join(freq_df, by = "Education") %>%
+  mutate(label_x = ifelse(Education == "2n Cycle", ymax + 0.03, ymax))
+```
+
+```{r}
+ggplot(plot_df) +
+  geom_rect(
+    aes(
+      xmin = xmin, xmax = xmax,
+      ymin = ymin, ymax = ymax,
+      fill = factor(Response)
+    ),
+    color = "white"
+  ) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_x_continuous(
+    breaks = freq_df$xmid, # all centers
+    labels = freq_df$Education, # same length
+    expand = c(0, 0),
+    guide = guide_axis(n.dodge = 2)
+  ) +
+  labs(
+    title = "Response distribution within Education\n(bar width = proportional to category size)",
+    x = "Education",
+    y = "Percentage",
+    fill = "Response"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 14)) 
+```
+
+### 3.6.3. Spending Differences by Response
+
+```{r}
+ifood_df$Response<-as.factor(ifood_df$Response)
+ggplot(ifood_df, aes(x=Response, y=MntTotal, fill=Response))+
+  geom_boxplot()+
+  ggtitle("Response by Total amount spent in regular products")+
+  theme_minimal()
+```
+
+### 3.6.4. Average Customer Characteristics by Response
+
+A new variable, *Children*, defined as the sum of *Kidhome* and
+*Teenhome*, was created to improve interpretability of the analysis.
+
+```{r}
+ifood_df2 <- ifood_df %>%
+  mutate(
+    Children = Kidhome + Teenhome,
+    AcceptedCmpOverall = AcceptedCmp1 + AcceptedCmp2 +
+      AcceptedCmp3 + AcceptedCmp4 + AcceptedCmp5
+  )
+
+ifood_df2 %>%
+  group_by(Response) %>%
+  summarise(
+    n          = n(),
+    mean_income = mean(Income, na.rm = TRUE),
+    mean_mnttotal = mean(MntTotal),
+    mean_age   = mean(Age),
+    mean_children = mean(Children),
+    mean_recency  = mean(Recency),
+    mean_customer_days = mean(Customer_Days),
+    mean_prev_cmp = mean(AcceptedCmpOverall)
+  )
+```
+
+### 3.6.5. Response Rate by Key Segments
+
+```{r}
+# Response rate by Education, Marital, Children
+ifood_df2 %>%
+  group_by(Education) %>%
+  summarise(resp_rate = mean(Response),
+            n = n()) %>%
+  arrange(desc(resp_rate))
+
+ifood_df2 %>%
+  group_by(Marital_Status) %>%
+  summarise(resp_rate = mean(Response),
+            n = n()) %>%
+  arrange(desc(resp_rate))
+
+ifood_df2 %>%
+  group_by(Children) %>%
+  summarise(resp_rate = mean(Response),
+            n = n()) %>%
+  arrange(Children)
+```
+
+## 3.7. Correlation Analysis
+
+```{r}
+num_for_corr <- ifood_df %>%
+  dplyr::select(
+    Age, Income, Teenhome, Kidhome, Recency,
+    MntWines, MntFruits, MntMeatProducts, MntFishProducts,
+    MntSweetProducts, MntGoldProds, MntTotal,
+    NumDealsPurchases, NumWebPurchases, NumCatalogPurchases,
+    NumStorePurchases, NumWebVisitsMonth, Customer_Days,
+    AcceptedCmp1, AcceptedCmp2, AcceptedCmp3,
+    AcceptedCmp4, AcceptedCmp5, TotalCmp
+  )
+
+corr_mat <- cor(num_for_corr, use = "pairwise.complete.obs")
+
+corrplot::corrplot(corr_mat, method = "color", tl.cex = 0.7,addgrid.col = "white")
+```
+
+# 4. Predictive Modeling
+
+## 4.1. Data Preparation for Modeling
+
+### 4.1.1. Response Variable Encoding
+
+```{r}
+ifood_df$Response <- factor(ifood_df$Response, levels = c(0,1), labels = c("No","Yes"))
+```
+
+### 4.1.2. Train-Validation-Test Split
+
+```{r}
+set.seed(333)
+sample <- createDataPartition(ifood_df$Response, p = 0.6, list = FALSE)
+train <- ifood_df[sample, ]
+rest <- ifood_df[-sample, ]
+
+idx_val <- createDataPartition(rest$Response, p = 0.375, list = FALSE)
+val  <- rest[idx_val, ]
+test <- rest[-idx_val, ]
+```
+
+### 4.1.3. Class Proportion Verification
+
+```{r}
+prop.table(table(train$Response))
+prop.table(table(val$Response))
+prop.table(table(test$Response))
+```
+
+### 4.1.4. Cross-Validation Strategy
+
+```{r}
+ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,   # compute ROC
+  savePredictions = TRUE
+)
+```
+
+## 4.2. Feature Encoding and Scaling
+
+### 4.2.1. Dummy Encoding of Categorical Variables
+
+```{r}
+X_train <- train[, !colnames(train) %in% "Response"]
+
+# Convert Education and Marital_Status into dummy variables
+X_train_num <- dummy_cols(
+  X_train, 
+  select_columns = c("Education", "Marital_Status"), 
+  remove_selected_columns = TRUE,   # removes original char columns
+  remove_first_dummy = TRUE         # avoids multicollinearity
+)
+
+X_val_num <- dummy_cols(
+  val[, !colnames(val) %in% "Response"],
+  select_columns = c("Education","Marital_Status"),
+  remove_selected_columns = TRUE,
+  remove_first_dummy = TRUE
+)
+
+X_test_num <- dummy_cols(
+  test[, !colnames(test) %in% "Response"],
+  select_columns = c("Education","Marital_Status"),
+  remove_selected_columns = TRUE,
+  remove_first_dummy = TRUE
+)
+```
+
+### 4.2.2. Feature Scaling
+
+```{r}
+train_scaled <- scale(X_train_num)
+val_scaled <- scale(
+  X_val_num,
+  center = attr(train_scaled, "scaled:center"),
+  scale  = attr(train_scaled, "scaled:scale")
+)
+
+test_scaled <- scale(
+  X_test_num,
+  center = attr(train_scaled, "scaled:center"),
+  scale  = attr(train_scaled, "scaled:scale")
+)
+```
+
+## 4.3. Logistic Regression Models
+
+### 4.3.1. Baseline Logistic Regression with Cross-Validation
+
+```{r}
+logit_cv <- train(
+  Response ~ . ,
+  data = train,
+  method = "glm",
+  family = "binomial",
+  metric = "ROC",
+  trControl = ctrl
+)
+logit_cv$results$ROC
+varImp(logit_cv)
+```
+
+### 4.3.2. Feature-Reduced Logistic Regression
+
+```{r}
+logit_cv <- train(
+  Response ~ . -MntMeatProducts -MntFishProducts -MntSweetProducts -MntWines -MntFruits -
+    AcceptedCmp1 -AcceptedCmp2 -AcceptedCmp3 -AcceptedCmp4 -AcceptedCmp5,
+  data = train,
+  method = "glm",
+  family = "binomial",
+  metric = "ROC",
+  trControl = ctrl
+)
+logit_cv$results$ROC
+varImp(logit_cv)
+```
+
+### 4.3.3. Final Logistic Regression Model
+
+```{r}
+final_model <- glm(
+  Response ~ . -MntMeatProducts -MntFishProducts -MntSweetProducts -MntWines -MntFruits -
+    AcceptedCmp1 -AcceptedCmp2 -AcceptedCmp3 -AcceptedCmp4 -AcceptedCmp5,
+  family = "binomial",
+  data = train
+)
+pscl::pR2(final_model)["McFadden"]
+car::vif(final_model)
+```
+
+### 4.3.4. Profit-Based Threshold Optimization (Validation Set)
+
+```{r}
+pred_val <- predict(final_model, val, type="response")
+
+gain_TP <- 8
+cost_FP <- 3
+
+ths <- seq(0, 1, by=0.001)
+
+compute_profit <- function(th){
+  pred_class <- ifelse(pred_val >= th, "Yes", "No")
+  sum(ifelse(pred_class=="Yes" & val$Response=="Yes",  gain_TP,
+      ifelse(pred_class=="Yes" & val$Response=="No", -cost_FP, 0)))
+}
+
+profits <- sapply(ths, compute_profit)
+
+best_cutoff_profit <- ths[which.max(profits)]
+best_cutoff_profit
+```
+
+### 4.3.5. Logistic Regression Performance on Test Set
+
+```{r}
+predicted <- predict(final_model, test, type="response")
+roc_obj <- roc(test$Response, predicted)
+plot(roc_obj, print.auc = TRUE, legacy.axes = TRUE)
+auc(roc_obj)
+```
+
+```{r}
+pred_class <- ifelse(predicted >= best_cutoff_profit, "Yes", "No")
+
+pred_class <- factor(pred_class, levels=c("No","Yes"))
+
+conf_mat <- confusionMatrix(pred_class, test$Response, positive = "Yes")
+conf_mat
+
+profit <- ifelse(pred_class == "Yes" & test$Response == "Yes", 8,
+                 ifelse(pred_class == "Yes" & test$Response == "No", -3, 0))
+
+total_profit <- sum(profit)
+total_profit
+```
+
+### 4.3.6. Alternative Profit-Based Threshold Evaluation
+
+```{r}
+profit_cutoff <- 3/11
+pred_class1 <- ifelse(predicted >= profit_cutoff, "Yes", "No")
+
+pred_class1 <- factor(pred_class1, levels=c("No","Yes"))
+
+conf_mat1 <- confusionMatrix(pred_class1, test$Response, positive = "Yes")
+conf_mat1
+
+profit1 <- ifelse(pred_class1 == "Yes" & test$Response == "Yes", 8,
+                 ifelse(pred_class1 == "Yes" & test$Response == "No", -3, 0))
+
+total_profit1 <- sum(profit1)
+total_profit1
+```
+
+## 4.4. LASSO Regression
+
+## 4.4.1. Data preparation and model fitting
+
+```{r}
+ifood_df$Response <- as.numeric(ifood_df$Response)
+
+# Convert to model matrices
+x_train <- model.matrix(Response ~ ., data = train)[, -1]
+y_train <- train$Response
+
+x_val <- model.matrix(Response ~ ., data = val)[, -1]
+y_val <- val$Response
+
+x_test <- model.matrix(Response ~ ., data = test)[, -1]
+y_test <- test$Response
+
+set.seed(333)
+
+cv_lasso <- cv.glmnet(
+  x_train,
+  y_train,
+  family = "binomial",
+  alpha = 1, # alpha = 1 → LASSO
+  nfolds = 10
+)
+lasso_coef <- coef(cv_lasso, s = "lambda.min")
+lasso_coef
+```
+
+### 4.4.2. Profit-based cutoff selection (validation set)
+
+```{r}
+pred_lasso_val <- as.numeric(predict(cv_lasso, x_val, s="lambda.min", type="response"))
+
+gain_TP <- 8
+cost_FP <- 3
+
+ths <- seq(0, 1, by=0.001)
+
+compute_profit_lasso <- function(th){
+  pred_class <- ifelse(pred_lasso_val >= th, "Yes", "No")
+  pred_class <- factor(pred_class, levels=c("No","Yes"))
+  sum(ifelse(pred_class=="Yes" & y_val=="Yes",  gain_TP,
+      ifelse(pred_class=="Yes" & y_val=="No", -cost_FP, 0)))
+}
+
+profits_lasso <- sapply(ths, compute_profit_lasso)
+
+best_cutoff_profit_lasso <- ths[which.max(profits_lasso)]
+best_cutoff_profit_lasso
+```
+
+### 4.4.3. Test set performance (optimal cutoff)
+
+```{r}
+predicted_lasso <- predict(cv_lasso, newx = x_test, s = "lambda.min", type = "response")
+
+roc_obj_lasso <- roc(test$Response, predicted_lasso)
+plot(roc_obj_lasso, print.auc = TRUE, legacy.axes = TRUE)
+roc_obj_lasso$auc
+
+pred_class_lasso <- ifelse(predicted_lasso >= best_cutoff_profit_lasso, "Yes", "No")
+
+pred_class_lasso <- factor(pred_class_lasso, levels=c("No","Yes"))
+test$Response <- factor(test$Response, levels=c("No","Yes"))
+
+
+conf_matrix_lasso <- confusionMatrix(pred_class_lasso, test$Response, positive="Yes")
+conf_matrix_lasso
+
+profit_lasso <- ifelse(pred_class_lasso == "Yes" & test$Response == "Yes", 8,
+                 ifelse(pred_class_lasso == "Yes" & test$Response == "No", -3, 0))
+
+total_profit_lasso <- sum(profit_lasso)
+total_profit_lasso
+```
+
+### 4.4.4. Test set performance (fixed cutoff)
+
+```{r}
+pred_class1_lasso <- ifelse(predicted_lasso >= profit_cutoff, "Yes", "No")
+
+pred_class1_lasso <- factor(pred_class1_lasso, levels=c("No","Yes"))
+
+conf_mat1_lasso <- confusionMatrix(pred_class1_lasso, test$Response, positive = "Yes")
+conf_mat1_lasso
+
+profit_lasso1 <- ifelse(pred_class1_lasso == "Yes" & test$Response == "Yes", 8,
+                 ifelse(pred_class1_lasso == "Yes" & test$Response == "No", -3, 0))
+
+total_profit_lasso1 <- sum(profit_lasso1)
+total_profit_lasso1
+```
+
+### 4.5. LASSO with interactions
+
+### 4.5.1. Data preparation and model fitting
+
+```{r}
+# Convert to model matrices
+x_train2 <- model.matrix(Response ~ (.)^2, data = train)[, -1]
+y_train2 <- train$Response
+
+x_val2 <- model.matrix(Response ~ (.)^2, data = val)[, -1]
+y_val2 <- val$Response
+
+x_test2 <- model.matrix(Response ~ (.)^2, data = test)[, -1]
+y_test2 <- test$Response
+
+set.seed(333)
+
+cv_lasso2 <- cv.glmnet(
+  x_train2,
+  y_train2,
+  family = "binomial",
+  alpha = 1,          # alpha = 1 → LASSO
+  nfolds = 10
+)
+lasso_coef2 <- coef(cv_lasso2, s = "lambda.min")
+lasso_coef2
+```
+
+### 4.5.2. Profit-based cutoff selection
+
+```{r}
+pred_lasso2_val <- predict(cv_lasso2, x_val2, s="lambda.min", type="response")
+
+gain_TP <- 8
+cost_FP <- 3
+
+ths <- seq(0, 1, by=0.001)
+
+compute_profit_lasso2 <- function(th){
+  pred_class <- ifelse(pred_lasso2_val >= th, "Yes", "No")
+  pred_class <- factor(pred_class, levels=c("No","Yes"))
+  sum(ifelse(pred_class=="Yes" & y_val=="Yes",  gain_TP,
+      ifelse(pred_class=="Yes" & y_val=="No", -cost_FP, 0)))
+}
+
+profits_lasso2 <- sapply(ths, compute_profit_lasso2)
+
+best_cutoff_profit_lasso2 <- ths[which.max(profits_lasso2)]
+best_cutoff_profit_lasso2
+```
+
+### 4.5.3. Test set performance (optimal cutoff)
+
+```{r}
+predicted_lasso2 <- predict(cv_lasso2, newx = x_test2, s = "lambda.min", type = "response")
+
+roc_obj_lasso2 <- roc(test$Response, predicted_lasso2)
+plot(roc_obj_lasso2, print.auc = TRUE, legacy.axes = TRUE)
+roc_obj_lasso2$auc
+
+pred_class_lasso2 <- ifelse(predicted_lasso2 >= best_cutoff_profit_lasso2, "Yes", "No")
+
+pred_class_lasso2 <- factor(pred_class_lasso2, levels=c("No","Yes"))
+test$Response <- factor(test$Response, levels=c("No","Yes"))
+
+conf_matrix_lasso2 <- confusionMatrix(pred_class_lasso2, test$Response, positive="Yes")
+conf_matrix_lasso2
+
+profit_lasso2 <- ifelse(pred_class_lasso2 == "Yes" & test$Response == "Yes", 8,
+                 ifelse(pred_class_lasso2 == "Yes" & test$Response == "No", -3, 0))
+
+total_profit_lasso2 <- sum(profit_lasso2)
+total_profit_lasso2
+```
+
+### 4.5.4. Test set performance (fixed cutoff)
+
+```{r}
+pred_class1_lasso2 <- ifelse(predicted_lasso2 >= profit_cutoff, "Yes", "No")
+
+pred_class1_lasso2 <- factor(pred_class1_lasso2, levels=c("No","Yes"))
+
+conf_mat1_lasso2 <- confusionMatrix(pred_class1_lasso2, test$Response, positive = "Yes")
+conf_mat1_lasso2
+
+profit1_lasso2 <- ifelse(pred_class1_lasso2 == "Yes" & test$Response == "Yes", 8,
+                 ifelse(pred_class1_lasso2 == "Yes" & test$Response == "No", -3, 0))
+
+total_profit1_lasso2 <- sum(profit1_lasso2)
+total_profit1_lasso2
+```
+
+```{r}
+ifood_df$Response <- factor(ifood_df$Response,
+                            levels = c(1, 2),
+                            labels = c("No", "Yes"))
+
+table(ifood_df$Response)
+```
+
+## 4.6. PCA + Logistic Regression
+
+### 4.6.1. Estimation
+
+```{r}
+#Select the numerical variables (excluding Response)
+
+pca_vars_train <- train %>%
+  dplyr::select(
+    Age, Income, Kidhome, Teenhome, Recency,
+    MntWines, MntFruits, MntMeatProducts, MntFishProducts,
+    MntSweetProducts, MntGoldProds, MntTotal,
+    NumDealsPurchases, NumWebPurchases, NumCatalogPurchases,
+    NumStorePurchases, NumWebVisitsMonth, Customer_Days,
+    TotalCmp
+  )
+
+# Fit PCA ONLY on training predictors (prevents data leakage)
+pca_res <- prcomp(pca_vars_train, center = TRUE, scale. = TRUE)
+
+# Summary (variance explained)
+summary(pca_res)
+```
+
+### 4.6.2. Choose number of PC's
+
+```{r}
+eigval   <- (pca_res$sdev)^2
+prop_var <- eigval / sum(eigval)
+cum_var  <- cumsum(prop_var)
+
+k_80    <- which(cum_var >= 0.80)[1]
+k_90    <- which(cum_var >= 0.90)[1]
+k_kaiser <- sum(eigval >= 1)
+
+cat("=== PCA retention criteria (TRAIN PCA) ===\n")
+cat("k (>=80% variance):", k_80, " | CumVar =", round(cum_var[k_80]*100, 2), "%\n")
+cat("k (>=90% variance):", k_90, " | CumVar =", round(cum_var[k_90]*100, 2), "%\n")
+cat("k (Kaiser eig>=1):", k_kaiser, " | CumVar =", round(cum_var[k_kaiser]*100, 2), "%\n\n")
+
+k <- k_kaiser
+
+#Scree plot
+scree_df <- data.frame(
+  PC = seq_along(eigval),
+  Variance = prop_var,
+  CumVar = cum_var
+)
+
+ggplot(scree_df, aes(x = PC, y = Variance)) +
+  geom_point(size = 3) +
+  geom_line() +
+  labs(
+    title = "Scree plot (proportion of variance explained)",
+    x = "Principal Component",
+    y = "Proportion of variance"
+  ) +
+  theme_minimal()
+```
+
+### 4.6.3. Interpretation of PCs
+
+```{r}
+#Interpret PCs via loadings
+
+top_loadings <- function(rotation_mat, pc, top_n) {
+  v <- rotation_mat[, pc]
+  out <- sort(abs(v), decreasing = TRUE)[1:top_n]
+  data.frame(
+    Variable = names(out),
+    Loading = rotation_mat[names(out), pc],
+    AbsLoading = out,
+    row.names = NULL
+  )
+}
+
+rotation <- pca_res$rotation
+
+cat("=== Top loadings (PC1) ===\n")
+print(top_loadings(rotation, pc = 1, top_n = 8))
+cat("\n=== Top loadings (PC2) ===\n")
+print(top_loadings(rotation, pc = 2, top_n = 8))
+cat("\n=== Top loadings (PC3) ===\n")
+print(top_loadings(rotation, pc = 3, top_n = 8))
+cat("\n=== Top loadings (PC4) ===\n")
+print(top_loadings(rotation, pc = 4, top_n = 8))
+cat("\n=== Top loadings (PC5) ===\n")
+print(top_loadings(rotation, pc = 5, top_n = 8))
+
+#PCA plots
+
+#Variables factor map
+fviz_pca_var(pca_res, col.var = "contrib") +
+  labs(title = "PCA – Variable contributions (PC1 vs PC2)")
+
+# Individuals factor map by Response
+resp_factor <- as.factor(train$Response)
+
+fviz_pca_ind(
+  pca_res,
+  geom = "point",
+  habillage = resp_factor,
+  addEllipses = TRUE,
+  ellipse.level = 0.95
+) + labs(title = "PCA – Individuals (colored by Response)")
+```
+
+### 4.6.4. Model Training
+
+```{r}
+
+k <- 9
+
+# Project TRAIN / VAL / TEST onto the PCA space learned from TRAIN
+PC_train <- as.data.frame(predict(pca_res, newdata = pca_vars_train)[, 1:k, drop = FALSE])
+PC_train$Response <- factor(train$Response, levels = c("No", "Yes"))
+
+pca_vars_val <- val %>%
+  dplyr::select(names(pca_vars_train))
+PC_val <- as.data.frame(predict(pca_res, newdata = pca_vars_val)[, 1:k, drop = FALSE])
+PC_val$Response <- factor(val$Response, levels = c("No", "Yes"))
+
+pca_vars_test <- test %>%
+  dplyr::select(names(pca_vars_train))
+PC_test <- as.data.frame(predict(pca_res, newdata = pca_vars_test)[, 1:k, drop = FALSE])
+PC_test$Response <- factor(test$Response, levels = c("No", "Yes"))
+
+# Fit logistic model on PCs
+model_pca <- glm(Response ~ ., data = PC_train, family = binomial)
+pscl::pR2(model_pca)["McFadden"]
+
+```
+
+### 4.6.5. Profit-based cutoff selection
+
+```{r}
+pred_pca_val <- predict(model_pca, newdata = PC_val, type = "response")
+
+gain_TP <- 8
+cost_FP <- 3
+
+ths <- seq(0, 1, by = 0.001)
+
+compute_profit <- function(th) {
+  pred_class <- ifelse(pred_pca_val >= th, "Yes", "No")
+  pred_class <- factor(pred_class, levels = c("No", "Yes"))
+  y_true <- PC_val$Response
+
+  sum(ifelse(pred_class == "Yes" & y_true == "Yes",  gain_TP,
+      ifelse(pred_class == "Yes" & y_true == "No",  -cost_FP, 0)))
+}
+
+profits <- sapply(ths, compute_profit)
+best_cutoff_profit_pca <- ths[which.max(profits)]
+best_cutoff_profit_pca
+
+```
+
+### 4.6.6. Test set performance (optimal cutoff)
+
+```{r}
+predicted_pca <- predict(model_pca, newdata = PC_test, type = "response")
+
+roc_obj_pca <- pROC::roc(PC_test$Response, predicted_pca)
+plot(roc_obj_pca, print.auc = TRUE, legacy.axes = TRUE)
+roc_obj_pca$auc
+
+pred_class_pca <- ifelse(predicted_pca >= best_cutoff_profit_pca, "Yes", "No")
+pred_class_pca <- factor(pred_class_pca, levels = c("No","Yes"))
+
+conf_matrix_pca <- caret::confusionMatrix(pred_class_pca, PC_test$Response, positive = "Yes")
+conf_matrix_pca
+
+profit_pca <- ifelse(pred_class_pca == "Yes" & PC_test$Response == "Yes",  8,
+              ifelse(pred_class_pca == "Yes" & PC_test$Response == "No",  -3, 0))
+total_profit_pca <- sum(profit_pca)
+total_profit_pca
+```
+
+### 4.6.7. Test set performance (fixed cutoff)
+
+```{r}
+pred_class_fixed <- ifelse(predicted_pca >= profit_cutoff, "Yes", "No")
+pred_class_fixed <- factor(pred_class_fixed, levels = c("No","Yes"))
+
+conf_mat_fixed <- caret::confusionMatrix(pred_class_fixed, PC_test$Response, positive = "Yes")
+conf_mat_fixed
+
+profit_fixed <- ifelse(pred_class_fixed == "Yes" & PC_test$Response == "Yes",  8,
+                ifelse(pred_class_fixed == "Yes" & PC_test$Response == "No",  -3, 0))
+sum(profit_fixed)
+```
+
+## 4.7. Linear Discriminant Analysis (LDA)
+
+### 4.7.1. Data preparation and model fitting
+
+```{r}
+train_scaled_df <- as.data.frame(train_scaled)
+train_scaled_df$Response <- train$Response
+
+val_scaled_df <- as.data.frame(val_scaled)
+val_scaled_df$Response <- val$Response
+
+test_scaled_df <- as.data.frame(test_scaled)
+test_scaled_df$Response <- test$Response
+
+balanced_priors <- c(0.5, 0.5)
+
+lda_model <- lda(Response ~ .-MntMeatProducts -MntFishProducts -MntSweetProducts
+                 -MntWines -MntFruits 
+                 -AcceptedCmp1 -AcceptedCmp2 -AcceptedCmp3 -AcceptedCmp4
+                 -AcceptedCmp5, 
+                 data = train_scaled_df,
+                 prior = balanced_priors)
+```
+
+### 4.7.2. Profit-based cutoff selection
+
+```{r}
+pred_lda_val <- predict(lda_model, newdata = val_scaled_df, type="response")
+prob_lda_val <- pred_lda_val$posterior[,"Yes"]
+gain_TP <- 8
+cost_FP <- 3
+
+ths <- seq(0, 1, by=0.001)
+
+compute_profit_lda <- function(th){
+  pred_class <- ifelse(prob_lda_val >= th, "Yes", "No")
+  pred_class <- factor(pred_class, levels=c("No","Yes"))
+  sum(ifelse(pred_class=="Yes" & y_val=="Yes",  gain_TP,
+      ifelse(pred_class=="Yes" & y_val=="No", -cost_FP, 0)))
+}
+
+profits_lda <- sapply(ths, compute_profit_lda)
+
+best_cutoff_profit_lda <- ths[which.max(profits_lda)]
+best_cutoff_profit_lda
+```
+
+### 4.7.3. Test set performance (optimal cutoff)
+
+```{r}
+predicted_lda <- predict(lda_model, newdata = test_scaled_df, type = "response")
+prob_lda <- predicted_lda$posterior[,"Yes"]
+
+roc_obj_lda <- roc(test$Response, prob_lda)
+plot(roc_obj_lda, print.auc = TRUE, legacy.axes = TRUE)
+roc_obj_lda$auc
+
+pred_class_lda <- ifelse(prob_lda>= best_cutoff_profit_lda, "Yes", "No")
+pred_class_lda <- factor(pred_class_lda, levels=c("No","Yes"))
+test$Response <- factor(test$Response, levels=c("No","Yes"))
+
+conf_matrix_lda <- confusionMatrix(pred_class_lda, test$Response, positive="Yes")
+conf_matrix_lda
+
+profit_lda <- ifelse(pred_class_lda == "Yes" & test$Response == "Yes", 8,
+                 ifelse(pred_class_lda == "Yes" & test$Response == "No", -3, 0))
+
+total_profit_lda <- sum(profit_lda)
+total_profit_lda
+```
+
+### 4.7.4. Test set performance (fixed cutoff)
+
+```{r}
+pred_class1_lda <- ifelse(prob_lda >= 3/11, "Yes", "No")
+
+pred_class1_lda <- factor(pred_class1_lda, levels=c("No","Yes"))
+
+conf_mat1_lda <- confusionMatrix(pred_class1_lda, test$Response, positive = "Yes")
+conf_mat1_lda
+
+profit1_lda <- ifelse(pred_class1_lda == "Yes" & test$Response == "Yes", 8,
+                 ifelse(pred_class1_lda == "Yes" & test$Response == "No", -3, 0))
+
+total_profit1_lda <- sum(profit1_lda)
+total_profit1_lda
+```
+
+## 4.8. Random Forests
+
+### 4.8.1. Model Training
+
+```{r}
+set.seed(333)
+
+rf_model <- ranger(
+  Response ~ . -MntMeatProducts -MntWines -MntFishProducts -MntSweetProducts  -MntFruits -
+    AcceptedCmp1 -AcceptedCmp2 -AcceptedCmp3 -AcceptedCmp4 -AcceptedCmp5 ,
+  data = train,
+  probability = TRUE, # necessary to generate probabilities
+  num.trees = 500,
+  mtry = 5,
+  min.node.size = 10, # standard rule
+  importance = "impurity"
+)
+```
+
+### 4.8.2. Profit-based cutoff selection
+
+```{r}
+pred_val_rf <- predict(rf_model, val, type="response")$predictions[,"Yes"]
+
+gain_TP <- 8
+cost_FP <- 3
+
+ths <- seq(0, 1, by=0.001)
+
+compute_profit_rf <- function(th){
+  pred_class <- ifelse(pred_val_rf >= th, "Yes", "No")
+  sum(ifelse(pred_class=="Yes" & y_val=="Yes",  gain_TP,
+      ifelse(pred_class=="Yes" & y_val=="No", -cost_FP, 0)))
+}
+
+profits_rf <- sapply(ths, compute_profit_rf)
+
+best_cutoff_profit_rf <- ths[which.max(profits_rf)]
+best_cutoff_profit_rf
+```
+
+### 4.8.3. Test set performance (optimal cutoff)
+
+```{r}
+predicted_rf <- predict(rf_model, data = test)$predictions[,"Yes"]
+
+roc_obj_rf <- roc(test$Response, predicted_rf)
+plot(roc_obj_rf, print.auc = TRUE, legacy.axes = TRUE)
+roc_obj_rf$auc
+
+
+pred_class_rf <- ifelse(predicted_rf>= best_cutoff_profit_rf, "Yes", "No")
+pred_class_rf <- factor(pred_class_rf, levels=c("No","Yes"))
+test$Response <- factor(test$Response, levels=c("No","Yes"))
+
+conf_matrix_rf <- confusionMatrix(pred_class_rf, test$Response, positive="Yes")
+conf_matrix_rf
+
+profit_rf <- ifelse(pred_class_rf == "Yes" & test$Response == "Yes", 8,
+                 ifelse(pred_class_rf == "Yes" & test$Response == "No", -3, 0))
+
+total_profit_rf <- sum(profit_rf)
+total_profit_rf
+```
+
+### 4.8.4. Test set performance (fixed cutoff)
+
+```{r}
+pred_class1_rf <- ifelse(predicted_rf >= profit_cutoff, "Yes", "No")
+
+pred_class1_rf <- factor(pred_class1_rf, levels=c("No","Yes"))
+
+conf_mat1_rf <- confusionMatrix(pred_class1_rf, test$Response, positive = "Yes")
+conf_mat1_rf
+
+profit1_rf <- ifelse(pred_class1_rf == "Yes" & test$Response == "Yes", 8,
+                 ifelse(pred_class1_rf == "Yes" & test$Response == "No", -3, 0))
+
+total_profit1_rf <- sum(profit1_rf)
+total_profit1_rf
+```
+
+### 4.8.5. Hyperparameter grid search (validation profit)
+
+```{r}
+grid <- expand.grid(
+  num.trees = c(100, 500, 700, 1000),
+  mtry = c(3,4,5, 6, 7,8,9),
+  min.node.size = c(5, 10,15, 20)
+)
+
+results <- data.frame()
+
+for(i in 1:nrow(grid)){
+  rf_tmp <- ranger(
+    Response ~ .-MntMeatProducts -MntWines -MntFishProducts -MntSweetProducts  -MntFruits -
+    AcceptedCmp1 -AcceptedCmp2 -AcceptedCmp3 -AcceptedCmp4 -AcceptedCmp5,
+    data = train,
+    probability = TRUE,
+    num.trees = grid$num.trees[i],
+    mtry = grid$mtry[i],
+    min.node.size = grid$min.node.size[i]
+  )
+  
+  pred_val <- predict(rf_tmp, data = val)$predictions[,"Yes"]
+  
+  profit <- max(sapply(ths, function(th){
+    pred_class <- ifelse(pred_val >= th, "Yes", "No")
+    sum(ifelse(pred_class=="Yes" & y_val=="Yes", 8,
+               ifelse(pred_class=="Yes" & y_val=="No", -3, 0)))
+  }))
+  
+  results <- rbind(results,
+    data.frame(mtry = grid$mtry[i],
+               min.node.size = grid$min.node.size[i],
+               num.trees = grid$num.trees[i],
+               profit = profit)
+  )
+}
+
+results
+```
+
+### 4.8.6. Full-dataset profit analysis
+
+```{r}
+# Compute profit over the entire dataset. This is not a performance metric, since it is not evaluated exclusively on the test set.
+ifood_df$Response <- factor(ifood_df$Response, levels = c("No","Yes"))
+pred_all_rf <- predict(rf_model, data = ifood_df)$predictions[,"Yes"]
+pred_class_all_rf <- ifelse(pred_all_rf >= best_cutoff_profit_rf, "Yes", "No")
+pred_class_all_rf <- factor(pred_class_all_rf, levels = c("No","Yes"))
+profit_all_rf <- ifelse(pred_class_all_rf == "Yes" & ifood_df$Response == "Yes", 8,
+                        ifelse(pred_class_all_rf == "Yes" & ifood_df$Response == "No", -3, 0))
+
+total_profit_all_rf <- sum(profit_all_rf)
+total_profit_all_rf
+mean_profit_all_rf <- mean(profit_all_rf)
+mean_profit_all_rf
+mean(pred_class_all_rf == "Yes")
+```
+
+
+## 4.9. Multilayer Perceptron
+
+### 4.9.1 Hyperparameter search
+
+```{r}
+library(nnet)
+set.seed(2025)
+
+# using random search to tune hyperparameters
+param_grid <- list(
+  size = sample(5:64, 50, replace = TRUE),      # hidden units
+  decay = runif(50, 0, 0.1),                    # weight decay
+  maxit = sample(c(100, 200, 500), 50, replace = TRUE)
+)
+
+results <- data.frame(size = integer(),
+                      decay = numeric(),
+                      maxit = integer(),
+                      bal_acc = numeric())
+
+
+# 5-fold cv sorted by mean profit
+k <- 5
+folds <- sample(rep(1:k, length.out = nrow(train)))
+
+for (i in 1:length(param_grid$size)) {
+  print(i)
+
+  size_i <- param_grid$size[i]
+  decay_i <- param_grid$decay[i]
+  maxit_i <- param_grid$maxit[i]
+  cv_results <- numeric(k)
+  for (j in 1:k) {
+
+    train_idx <- which(folds != j)
+    m_train <- X_train_num[train_idx,]
+    val_idx   <- which(folds == j)
+    m_val <- X_train_num[val_idx,]
+    
+    m_train <- scale(m_train)
+    m_val <- scale(
+      m_val,
+      center = attr(m_train, "scaled:center"),
+      scale  = attr(m_train, "scaled:scale")
+    )
+    
+    m_train <- as.data.frame(m_train)
+    m_val   <- as.data.frame(m_val)
+    
+    colnames(m_train) <- colnames(X_train_num)
+    colnames(m_val)   <- colnames(X_train_num)
+  
+    m_train$Response <- train[train_idx,]$Response
+    m_val$Response <- train[val_idx,]$Response
+
+    model <- nnet(Response ~ .-MntMeatProducts -MntWines -MntFishProducts -MntSweetProducts  -MntFruits, data = m_train, size = size_i, decay = decay_i, maxit = maxit_i, trace = FALSE, MaxNWts = 2000)
+
+        prob <- predict(model, m_val,type = "raw")
+
+    predictions <- ifelse(prob > 3/11, 1L, 0L)
+    true <- ifelse(m_val$Response == "Yes", 1L, 0L)
+
+    p <- sum(predictions * (11 * true - 3))
+
+    cv_results[j] <- p
+  }
+  p_mean = sum(cv_results)/5
+  results <- rbind(results, data.frame(size = size_i, decay = decay_i,
+                                         maxit = maxit_i, profit = p_mean))
+}
+
+# Sort results by profit
+results <- results %>% arrange(desc(profit))
+print(results)
+
+```
+
+### 4.9.2 Model training and theoretical cutoff
+
+```{r}
+set.seed(2025)
+# theoretical cutoff
+
+size <- 35
+decay <- 0.061169863
+maxit <- 200
+
+m_train <- X_train_num
+m_val <- X_val_num
+m_test <- X_test_num
+
+m_train <- scale(m_train)
+m_val <- scale(
+  m_val,
+  center = attr(m_train, "scaled:center"),
+  scale  = attr(m_train, "scaled:scale")
+)
+
+m_test <- scale(
+  m_test,
+  center = attr(m_train, "scaled:center"),
+  scale  = attr(m_train, "scaled:scale")
+)
+
+m_train <- as.data.frame(m_train)
+m_val   <- as.data.frame(m_val)
+m_test <- as.data.frame(m_test)
+
+colnames(m_train) <- colnames(X_train_num)
+colnames(m_val)   <- colnames(X_val_num)
+colnames(m_test)   <- colnames(X_test_num)
+
+m_train$Response <- train$Response
+m_val$Response <- val$Response
+m_test$Response <- test$Response
+
+
+model <- nnet(Response ~ .-MntMeatProducts -MntWines -MntFishProducts -MntSweetProducts  -MntFruits, data = m_train, size = size, decay = decay, maxit = maxit, trace = FALSE, MaxNWts = 2000)
+
+prob <- predict(model, m_test, type = "raw")
+    
+predictions <- ifelse(prob > 3/11, 1L, 0L)
+true <- ifelse(m_test$Response == "Yes", 1L, 0L)
+
+p <- sum(predictions * (11 * true - 3))
+
+conf_mat <- confusionMatrix(factor(predictions,levels=c(0,1)), factor(true,c(0,1)), positive = "1")
+
+sensitivity <- conf_mat$byClass["Sensitivity"]
+specificity <- conf_mat$byClass["Specificity"]
+ppv <- conf_mat$byClass["Pos Pred Value"]
+balanced_acc <- conf_mat$byClass["Balanced Accuracy"]
+
+roc_obj <- roc(true, as.numeric(prob))
+auc_val <- auc(roc_obj)
+
+print(paste("Sens:",sensitivity))
+print(paste("Spec:",specificity))
+print(paste("PPV:",ppv))
+print(paste("Bal_acc",balanced_acc))
+
+print(paste("AUC:",auc_val))
+
+print(paste("Profit:",p))
+```
+
+### 4.9.3 Empirical cutoff
+
+```{r}
+set.seed(2025)
+# empirical cutoff
+
+pred_val <- predict(model, m_val, type="raw")
+true <- ifelse(m_val$Response == "Yes", 1L, 0L)
+
+gain_TP <- 8
+cost_FP <- 3
+
+ths <- seq(0, 1, by=0.001)
+
+compute_profit_mlp <- function(th){
+  pred_class <- ifelse(pred_val >= th, 1, 0)
+  sum(ifelse(pred_class==1 & true==1,  gain_TP,
+      ifelse(pred_class==1 & true==0, -cost_FP, 0)))
+}
+
+profits_mlp <- sapply(ths, compute_profit_mlp)
+
+best_cutoff_profit_mlp <- ths[which.max(profits_mlp)]
+best_cutoff_profit_mlp
+
+prob <- predict(model, m_test, type = "raw")
+    
+predictions <- ifelse(prob > best_cutoff_profit_mlp, 1L, 0L)
+true <- ifelse(m_test$Response == "Yes", 1L, 0L)
+
+p <- sum(predictions * (11 * true - 3))
+
+conf_mat <- confusionMatrix(factor(predictions,levels=c(0,1)), factor(true,c(0,1)), positive = "1")
+
+sensitivity <- conf_mat$byClass["Sensitivity"]
+specificity <- conf_mat$byClass["Specificity"]
+ppv <- conf_mat$byClass["Pos Pred Value"]
+balanced_acc <- conf_mat$byClass["Balanced Accuracy"]
+
+roc_obj <- roc(true, as.numeric(prob))
+auc_val <- auc(roc_obj)
+
+print(paste("Sens:",sensitivity))
+print(paste("Spec:",specificity))
+print(paste("PPV:",ppv))
+print(paste("Bal_acc",balanced_acc))
+
+print(paste("AUC:",auc_val))
+
+print(paste("Profit:",p))
+```
+
+# 5. PAC and Farness
+
+```{r}
+
+# Predicted probabilities (Lasso)
+prob_test <- as.numeric(predict(cv_lasso, newx = x_test, s = "lambda.min", type = "response"))
+
+# Compute PAC
+PAC_test <- pmin(prob_test, 1 - prob_test)
+
+#Compute Farness
+# Standardize using TRAIN stats
+X_train_scaled <- as.matrix(scale(x_train))
+X_test_scaled  <- scale(
+  x_test,
+  center = attr(X_train_scaled, "scaled:center"),
+  scale  = attr(X_train_scaled, "scaled:scale")
+)
+X_test_scaled <- as.matrix(X_test_scaled)
+
+# Make sure Response is consistently coded for centroid selection
+y_train_fac <- if (is.numeric(train$Response)) factor(train$Response, levels = c(0,1), labels = c("No","Yes")) else factor(train$Response)
+y_test_fac  <- if (is.numeric(test$Response))  factor(test$Response,  levels = c(0,1), labels = c("No","Yes")) else factor(test$Response)
+
+# Class centroids (in standardized space)
+centroid_yes <- colMeans(X_train_scaled[y_train_fac == "Yes", , drop = FALSE])
+centroid_no  <- colMeans(X_train_scaled[y_train_fac == "No",  , drop = FALSE])
+
+# Farness: distance to own-class centroid
+farness_test <- sapply(seq_len(nrow(X_test_scaled)), function(i) {
+  if (y_test_fac[i] == "Yes") {
+    sqrt(sum((X_test_scaled[i, ] - centroid_yes)^2))
+  } else {
+    sqrt(sum((X_test_scaled[i, ] - centroid_no)^2))
+  }
+})
+
+# Plot PAC vs Farness visualization
+pac_farness_df <- data.frame(
+  PAC = PAC_test,
+  Farness = farness_test,
+  TrueClass = y_test_fac
+)
+
+ggplot(pac_farness_df, aes(x = Farness, y = PAC, color = TrueClass)) +
+  geom_point(alpha = 0.6) +
+  theme_minimal() +
+  labs(
+    title = "PAC vs Farness – Lasso Logistic Regression",
+    x = "Farness",
+    y = "Probability of Alternative Class (PAC)"
+  )
+```
